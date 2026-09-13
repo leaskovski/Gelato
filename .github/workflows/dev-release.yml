@@ -1,8 +1,14 @@
 name: Dev Release
 
-# Fork-only: builds the current branch as a prerelease and publishes it in a
-# separate plugin repository on the gh-pages branch. Upstream ships real
+# Fork-only: builds a branch or pull request as a prerelease and publishes it in
+# a separate plugin repository on the gh-pages branch. Upstream ships real
 # releases through release.yml and publish.yml.
+#
+# Without "ref" it builds the branch the workflow runs on. With a pull request
+# number (3 or #3) it builds that pull request's head, with a branch, tag or
+# commit that ref. The workflow itself always comes from the branch it runs on,
+# so pull requests based on upstream main, which do not have this file, can be
+# built from main.
 #
 # Dev versions keep build.yaml's major.minor.patch and turn the last part into
 # rev * 1000 + run number, so 0.26.17.1 becomes 0.26.17.1042. That sorts above
@@ -11,6 +17,10 @@ name: Dev Release
 on:
   workflow_dispatch:
     inputs:
+      ref:
+        description: Pull request number, branch, tag or commit to build (empty = this branch)
+        required: false
+        default: ""
       keep:
         description: How many dev releases to keep (older ones are deleted)
         required: false
@@ -32,11 +42,34 @@ jobs:
       PAGES_BRANCH: gh-pages
       MANIFEST: repository.json
       KEEP: ${{ inputs.keep || '10' }}
+      INPUT_REF: ${{ inputs.ref }}
     steps:
+      - name: Resolve what to build
+        id: source
+        run: |
+          ref="${INPUT_REF#\#}"
+          if [ -z "$ref" ]; then
+            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            echo "label=\`$GITHUB_REF_NAME\`" >> "$GITHUB_OUTPUT"
+          elif [[ "$ref" =~ ^[0-9]+$ ]]; then
+            pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$ref")
+            echo "ref=refs/pull/$ref/head" >> "$GITHUB_OUTPUT"
+            echo "label=pull request $ref (\`$(jq -r .head.label <<< "$pr")\`)" >> "$GITHUB_OUTPUT"
+            echo "base=$(jq -r .base.ref <<< "$pr")" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$ref" >> "$GITHUB_OUTPUT"
+            echo "label=\`$ref\`" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
+          ref: ${{ steps.source.outputs.ref }}
           fetch-depth: 0
+
+      - name: Record commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set dev version
         id: version
@@ -53,14 +86,23 @@ jobs:
       - name: Write release notes
         env:
           TAG: ${{ steps.version.outputs.tag }}
+          LABEL: ${{ steps.source.outputs.label }}
+          BASE: ${{ steps.source.outputs.base }}
+          SHA: ${{ steps.commit.outputs.sha }}
         # Issue references are dropped or put in code spans, so the notes never
         # mention upstream issues and pull requests.
         run: |
           prev=$(git tag -l 'dev-v*' --sort=-v:refname | head -n1)
+          # A pull request lists its own commits: the previous dev build may be of another branch.
+          [ -z "$BASE" ] || git fetch origin "$BASE"
           {
-            echo "Dev build of \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA::7}."
+            echo "Dev build of $LABEL at ${SHA::7}."
             echo
-            if [ -n "$prev" ]; then
+            if [ -n "$BASE" ]; then
+              echo "### Commits"
+              echo
+              git log --no-merges --format='- %s (%h)' "FETCH_HEAD..HEAD"
+            elif [ -n "$prev" ] && git merge-base --is-ancestor "$prev" HEAD; then
               echo "### Changes since $prev"
               echo
               git log --no-merges --format='- %s (%h)' "$prev..HEAD"
@@ -89,13 +131,14 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ steps.version.outputs.tag }}
           ZIP: ${{ steps.jprm.outputs.artifact }}
+          SHA: ${{ steps.commit.outputs.sha }}
         run: |
           dir=$(dirname "$ZIP")
           name=$(basename "$ZIP")
           (cd "$dir" && md5sum "$name" > "${name%.*}.md5" && sha256sum "$name" > "${name%.*}.sha256")
           gh release create "$TAG" "$ZIP" "$dir/${name%.*}.md5" "$dir/${name%.*}.sha256" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+            --target "$SHA" \
             --prerelease \
             --title "Dev $VERSION" \
             --notes-file "$RUNNER_TEMP/notes.md"
