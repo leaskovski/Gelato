@@ -10,9 +10,20 @@ name: Dev Release
 # so pull requests based on upstream main, which do not have this file, can be
 # built from main.
 #
+# Every ref is its own channel with its own manifest, so a server that installed
+# one pull request never auto-updates to a build of another:
+#   ref=4          -> channel pr-4  -> gh-pages/pr-4/repository.json
+#   ref=feat/x     -> channel feat-x
+#   (empty) on main -> channel main
+# Jellyfin merges the versions of a plugin across all repositories configured on
+# a server and updates to the highest one, so add only one dev channel per server.
+# Releases are tagged dev-<channel>-v<version>, and "keep" counts per channel.
+#
 # Dev versions keep build.yaml's major.minor.patch and turn the last part into
 # rev * 1000 + run number, so 0.26.17.1 becomes 0.26.17.1042. That sorts above
 # the upstream release the branch is based on and below the next minor bump.
+# Run numbers are shared by all channels, so versions within a channel increase
+# but are not consecutive.
 
 on:
   workflow_dispatch:
@@ -22,7 +33,7 @@ on:
         required: false
         default: ""
       keep:
-        description: How many dev releases to keep (older ones are deleted)
+        description: How many dev releases to keep per channel (older ones are deleted)
         required: false
         default: "10"
 
@@ -51,15 +62,23 @@ jobs:
           if [ -z "$ref" ]; then
             echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
             echo "label=\`$GITHUB_REF_NAME\`" >> "$GITHUB_OUTPUT"
+            channel="$GITHUB_REF_NAME"
           elif [[ "$ref" =~ ^[0-9]+$ ]]; then
             pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$ref")
             echo "ref=refs/pull/$ref/head" >> "$GITHUB_OUTPUT"
             echo "label=pull request $ref (\`$(jq -r .head.label <<< "$pr")\`)" >> "$GITHUB_OUTPUT"
             echo "base=$(jq -r .base.ref <<< "$pr")" >> "$GITHUB_OUTPUT"
+            channel="pr-$ref"
           else
             echo "ref=$ref" >> "$GITHUB_OUTPUT"
             echo "label=\`$ref\`" >> "$GITHUB_OUTPUT"
+            channel="$ref"
           fi
+          # Used in a tag and a directory name: lower case, anything else becomes "-".
+          channel=$(tr '[:upper:]' '[:lower:]' <<< "$channel" | sed -E 's/[^a-z0-9._-]+/-/g; s/^[-.]+//; s/[-.]+$//')
+          [ -n "$channel" ] || { echo "Cannot derive a channel from '$ref'"; exit 1; }
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "Channel $channel"
 
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -73,30 +92,36 @@ jobs:
 
       - name: Set dev version
         id: version
+        env:
+          CHANNEL: ${{ steps.source.outputs.channel }}
         run: |
           base=$(yq '.version' build.yaml)
           IFS=. read -r major minor patch rev <<< "$base"
           version="$major.$minor.$patch.$((rev * 1000 + GITHUB_RUN_NUMBER))"
-          tag="dev-v$version"
+          tag="dev-$CHANNEL-v$version"
           sed -i "s/^version: .*/version: \"$version\"/" build.yaml
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "Dev version $version (based on $base)"
+          echo "Dev version $version (based on $base), tag $tag"
 
       - name: Write release notes
         env:
-          TAG: ${{ steps.version.outputs.tag }}
+          CHANNEL: ${{ steps.source.outputs.channel }}
           LABEL: ${{ steps.source.outputs.label }}
           BASE: ${{ steps.source.outputs.base }}
           SHA: ${{ steps.commit.outputs.sha }}
         # Issue references are dropped or put in code spans, so the notes never
         # mention upstream issues and pull requests.
         run: |
-          prev=$(git tag -l 'dev-v*' --sort=-v:refname | head -n1)
-          # A pull request lists its own commits: the previous dev build may be of another branch.
+          prefix="dev-$CHANNEL-v"
+          # Only this channel's tags: "dev-fix-v" also prefixes channel fix-v2's tags, hence the version check.
+          prev=$(git tag -l "$prefix*" --sort=-v:refname | while read -r t; do
+            [[ "${t#"$prefix"}" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && echo "$t"
+          done | head -n1)
+          # A pull request lists its own commits: the previous dev build may be of an older head.
           [ -z "$BASE" ] || git fetch origin "$BASE"
           {
-            echo "Dev build of $LABEL at ${SHA::7}."
+            echo "Dev build of $LABEL at ${SHA::7}, channel \`$CHANNEL\`."
             echo
             if [ -n "$BASE" ]; then
               echo "### Commits"
@@ -128,6 +153,7 @@ jobs:
       - name: Create GitHub release
         id: release
         env:
+          CHANNEL: ${{ steps.source.outputs.channel }}
           VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ steps.version.outputs.tag }}
           ZIP: ${{ steps.jprm.outputs.artifact }}
@@ -140,28 +166,34 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$SHA" \
             --prerelease \
-            --title "Dev $VERSION" \
+            --title "Dev $VERSION ($CHANNEL)" \
             --notes-file "$RUNNER_TEMP/notes.md"
           echo "checksum=$(cut -c1-32 "$dir/${name%.*}.md5")" >> "$GITHUB_OUTPUT"
           echo "url=https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$name" >> "$GITHUB_OUTPUT"
 
-      - name: Delete old dev releases
+      - name: Delete old dev releases of this channel
         id: prune
         env:
-          TAG: ${{ steps.version.outputs.tag }}
+          CHANNEL: ${{ steps.source.outputs.channel }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          tags=$( { gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
-            --jq '.[] | select(.tag_name | startswith("dev-v")) | .tag_name'; echo "$TAG"; } \
-            | sort -u | sed 's/^dev-v//' | sort -rV)
-          echo "$tags" | tail -n +"$((KEEP + 1))" | while read -r old; do
+          prefix="dev-$CHANNEL-v"
+          versions=$( { gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate --jq '.[].tag_name' \
+            | while read -r t; do
+                [[ "$t" == "$prefix"* ]] || continue
+                v="${t#"$prefix"}"
+                [[ "$v" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && echo "$v"
+              done; echo "$VERSION"; } | sort -u | sort -rV)
+          echo "$versions" | tail -n +"$((KEEP + 1))" | while read -r old; do
             [ -n "$old" ] || continue
-            echo "Deleting dev-v$old"
-            gh release delete "dev-v$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            echo "Deleting $prefix$old"
+            gh release delete "$prefix$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           done
-          echo "kept=$(echo "$tags" | head -n "$KEEP" | jq -R . | jq -cs .)" >> "$GITHUB_OUTPUT"
+          echo "kept=$(echo "$versions" | head -n "$KEEP" | jq -R . | jq -cs .)" >> "$GITHUB_OUTPUT"
 
       - name: Update plugin repository manifest
         env:
+          CHANNEL: ${{ steps.source.outputs.channel }}
           VERSION: ${{ steps.version.outputs.version }}
           CHECKSUM: ${{ steps.release.outputs.checksum }}
           SOURCE_URL: ${{ steps.release.outputs.url }}
@@ -176,9 +208,14 @@ jobs:
             git -C "$pages" checkout --orphan "$PAGES_BRANCH"
             git -C "$pages" rm -rfq .
           fi
-          [ -f "$pages/$MANIFEST" ] || echo '[]' > "$pages/$MANIFEST"
+          manifest="$pages/$CHANNEL/$MANIFEST"
+          mkdir -p "$(dirname "$manifest")"
+          [ -f "$manifest" ] || echo '[]' > "$manifest"
 
-          plugin=$(yq -o=json '{"category": .category, "description": .description, "guid": .guid, "name": .name, "overview": .overview, "owner": .owner}' build.yaml)
+          # The name stays "Gelato": Jellyfin installs into <name>_<version>, and another name would
+          # sit next to the installed plugin instead of replacing it. The overview shows the channel.
+          plugin=$(yq -o=json '{"category": .category, "description": .description, "guid": .guid, "name": .name, "overview": .overview, "owner": .owner}' build.yaml \
+            | jq --arg channel "$CHANNEL" '.overview += " (dev channel " + $channel + ")"')
           entry=$(jq -n \
             --arg version "$VERSION" \
             --arg targetAbi "$(yq '.targetAbi' build.yaml)" \
@@ -194,22 +231,23 @@ jobs:
               | map(select(.version | IN($kept[])))
               | sort_by(.version | split(".") | map(tonumber))
               | reverse
-            )}]' "$pages/$MANIFEST" > "$RUNNER_TEMP/manifest.json"
-          mv "$RUNNER_TEMP/manifest.json" "$pages/$MANIFEST"
-          cat "$pages/$MANIFEST"
+            )}]' "$manifest" > "$RUNNER_TEMP/manifest.json"
+          mv "$RUNNER_TEMP/manifest.json" "$manifest"
+          cat "$manifest"
 
           cd "$pages"
-          git add "$MANIFEST"
+          git add "$CHANNEL/$MANIFEST"
           git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit -m "Dev release $VERSION"
+            commit -m "Dev release $VERSION ($CHANNEL)"
           git push origin "HEAD:$PAGES_BRANCH"
 
       - name: Summary
         env:
+          CHANNEL: ${{ steps.source.outputs.channel }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           {
-            echo "### Dev release $VERSION"
+            echo "### Dev release $VERSION ($CHANNEL)"
             echo
-            echo "Plugin repository: \`https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$PAGES_BRANCH/$MANIFEST\`"
+            echo "Plugin repository: \`https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$PAGES_BRANCH/$CHANNEL/$MANIFEST\`"
           } >> "$GITHUB_STEP_SUMMARY"
