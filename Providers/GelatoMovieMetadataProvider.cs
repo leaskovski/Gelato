@@ -49,7 +49,10 @@ public sealed class GelatoMovieMetadataProvider(
         }
 
         if (meta is null || !meta.IsValid())
+        {
+            log.LogWarning("GelatoMovieMetadataProvider: no meta for {Name}", info.Name);
             return result;
+        }
 
         await manager.EnrichMetaAsync(meta, cancellationToken).ConfigureAwait(false);
 

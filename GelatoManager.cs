@@ -1288,7 +1288,14 @@ public sealed class GelatoManager(
                                             .GetMetaAsync(movie)
                                             .ConfigureAwait(false);
                                         if (meta is null)
+                                        {
+                                            _log.LogWarning(
+                                                "SyncSeriesTrees: No meta found for {Name} ({Id})",
+                                                movie.Name,
+                                                movie.Id
+                                            );
                                             break;
+                                        }
                                         await EnrichMetaAsync(meta, ct).ConfigureAwait(false);
                                         var digital = meta.GetDigitalReleaseDate();
                                         var oneYearAgo = DateTime.UtcNow.AddYears(-1);
@@ -1432,6 +1439,14 @@ public sealed class GelatoManager(
                             )
                             .ConfigureAwait(false);
                     }
+                    else
+                    {
+                        _log.LogWarning(
+                            "SyncSeriesTrees: No meta found for {Name} ({Id})",
+                            series.Name,
+                            series.Id
+                        );
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1490,7 +1505,7 @@ public sealed class GelatoManager(
             .ToList();
 
         _log.LogInformation(
-            "SyncSeriesTrees: {Count} local (non-gelato, non-continuing) series to extend for the first time.",
+            "SyncLocalSeriesTreesAsync: {Count} local (non-gelato, non-continuing) series to extend for the first time.",
             localSeries.Count
         );
 
@@ -1512,12 +1527,21 @@ public sealed class GelatoManager(
                     series.Tags = [.. (series.Tags ?? []), TreeSyncedTag];
                     persistence.SaveItems([series], ct);
                 }
+                else
+                {
+                    _log.LogWarning(
+                        "SyncLocalSeriesTreesAsync: No meta found for {Name} ({Id})",
+                        series.Name,
+                        series.Id
+                    );
+
+                }
             }
             catch (Exception ex)
             {
                 _log.LogError(
                     ex,
-                    "SyncSeriesTrees: virtual tree sync failed for {Name} ({Id})",
+                    "SyncLocalSeriesTreesAsync: virtual tree sync failed for {Name} ({Id})",
                     series.Name,
                     series.Id
                 );
