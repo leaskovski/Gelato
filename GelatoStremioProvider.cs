@@ -76,12 +76,7 @@ public class GelatoStremioProvider(
                     resp.StatusCode,
                     resp.ReasonPhrase
                 );
-
-                throw new HttpRequestException(
-                    $"HTTP {resp.StatusCode}: {resp.ReasonPhrase}",
-                    null,
-                    resp.StatusCode
-                );
+                return default;
             }
 
             await using var s = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
@@ -90,7 +85,7 @@ public class GelatoStremioProvider(
         catch (Exception ex)
         {
             log.LogError(ex, "GetJsonAsync: error fetching or parsing {Url}", url);
-            throw;
+            return default;
         }
     }
 
@@ -183,14 +178,20 @@ public class GelatoStremioProvider(
         var id = item.GetProviderId("Imdb");
         if (id is null)
         {
-            log.LogWarning("GetMetaAsync: {Name} has no imdb ID", item.Name);
             id = item.GetProviderId("Tmdb");
             if (id is null)
             {
-                log.LogWarning("GetMetaAsync: {Name} has no imdb and tmdb ID", item.Name);
-                return null;
+                id = item.GetProviderId("Stremio");
+                if (id is null)
+                {
+                    log.LogWarning("GetMetaAsync: {Name} has no imdbl, tmdb and stremio ID", item.Name);
+                    return null;
+                }
             }
-            id = $"tmdb:{id}";
+            else
+            {
+                id = $"tmdb:{id}";
+            }
         }
         return await GetMetaAsync(id, item.GetBaseItemKind().ToStremio()).ConfigureAwait(false);
     }
