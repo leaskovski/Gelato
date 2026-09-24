@@ -123,9 +123,10 @@ public sealed class ItemCountServiceDecorator(IItemCountService inner, IItemRepo
         if (result.Count == 0)
             return result;
 
-        // Jellyfin counts no user access here, only direct children: the episodes of a season by
-        // SeasonId, and by ParentId the items that sit in no season.
-        var streams = GetStreamRows(parentIds, null);
+        // Only direct children count here: the episodes of a season by SeasonId, and by ParentId
+        // the items that sit in no season. Since Jellyfin 12.1 the access filter applies here as
+        // well, so the rows linked as alternate versions are already left out.
+        var streams = GetStreamRows(parentIds, user);
         foreach (var stream in streams)
         {
             var parentId =
@@ -142,7 +143,8 @@ public sealed class ItemCountServiceDecorator(IItemCountService inner, IItemRepo
 
     /// <summary>
     /// The stream rows below any of <paramref name="ancestorIds"/> that
-    /// <paramref name="user"/> may see, which is what Jellyfin counted for them.
+    /// <paramref name="user"/> may see, which is what Jellyfin counted for them. Rows linked as
+    /// alternate versions are left out, as Jellyfin's access filter leaves them out of the counts.
     /// </summary>
     private List<BaseItem> GetStreamRows(IReadOnlyList<Guid> ancestorIds, User? user)
     {

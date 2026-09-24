@@ -98,8 +98,9 @@ public sealed class GelatoItemRepository(IItemRepository inner, IHttpContextAcce
         if (!isMediaListQuery)
             return filter;
 
-        // Do not override queries that explicitly target stream-tagged rows.
-        if (!isStreamTagQuery && filter.ExcludeTags.Length == 0)
+        // Do not override queries that explicitly target stream-tagged rows. Resume queries list
+        // the version that was played, and Jellyfin hides linked versions from all other lists.
+        if (!isStreamTagQuery && filter.ExcludeTags.Length == 0 && filter.IsResumable != true)
             filter.ExcludeTags = [GelatoManager.StreamTag];
 
         if (filter.MaxPremiereDate is not null || !filterUnreleased)
@@ -162,6 +163,9 @@ public sealed class GelatoItemRepository(IItemRepository inner, IHttpContextAcce
 
     public QueryFiltersLegacy GetQueryFiltersLegacy(InternalItemsQuery filter) =>
         inner.GetQueryFiltersLegacy(filter);
+
+    public IReadOnlyList<string> GetTagNames(InternalItemsQuery filter) =>
+        inner.GetTagNames(filter);
 
     public Task<bool> ItemExistsAsync(Guid id) => inner.ItemExistsAsync(id);
 
